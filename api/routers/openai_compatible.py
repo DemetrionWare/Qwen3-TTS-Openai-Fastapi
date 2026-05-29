@@ -603,7 +603,7 @@ async def create_speech(
 
 @router.websocket("/audio/speech/stream-input")
 @router.websocket("/audio/speech/stream-input/{voice_id}")
-async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
+async def websocket_tts_stream(websocket: WebSocket, voice_id: str = ""):
     """ElevenLabs-compatible bidirectional streaming TTS over WebSocket.
 
     Protocol (matches wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input):
@@ -655,7 +655,7 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
 
     # Shared config populated from the first control frame.
     state = {
-        "voice": voice_id or "Vivian",
+        "voice": voice_id or "",
         "language": "Auto",
         "model": "tts-1",
         "ref_audio": None,        # base64 string, set by first frame
