@@ -28,6 +28,69 @@ from ..structures.schemas import (
     VoiceCloneCapabilities,
 )
 from ..services.text_processing import normalize_text
+
+ULAW_FRAME_BYTES = 160      # 20ms at 8kHz mono
+ULAW_FRAME_INTERVAL = 0.020 # seconds
+ULAW_PREBUFFER_BYTES = 6400  # 800ms before starting playback — covers burst gaps
+
+
+async def pace_ulaw_stream(audio_generator):
+    """Buffer then pace ulaw_8000 output at real-time (160 bytes / 20ms).
+
+    Runs audio collection in a concurrent task so the model keeps generating
+    while we sleep between frames — no backpressure on the generator.
+    Accumulates 800ms before starting playback to cover the model's burst gaps.
+    """
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def _collect():
+        async for chunk in audio_generator:
+            if chunk:
+                await queue.put(chunk)
+        await queue.put(None)  # sentinel
+
+    collector = asyncio.create_task(_collect())
+
+    buffer = bytearray()
+    started = False
+    next_send = 0.0
+
+    try:
+        while True:
+            chunk = await asyncio.wait_for(queue.get(), timeout=30.0)
+            if chunk is None:
+                break
+
+            buffer.extend(chunk)
+
+            if not started and len(buffer) >= ULAW_PREBUFFER_BYTES:
+                started = True
+                next_send = loop.time()
+
+            if started:
+                while len(buffer) >= ULAW_FRAME_BYTES:
+                    delay = next_send - loop.time()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    yield bytes(buffer[:ULAW_FRAME_BYTES])
+                    del buffer[:ULAW_FRAME_BYTES]
+                    next_send += ULAW_FRAME_INTERVAL
+    finally:
+        collector.cancel()
+
+    # Drain remainder
+    if not started:
+        next_send = loop.time()
+    while len(buffer) >= ULAW_FRAME_BYTES:
+        delay = next_send - loop.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        yield bytes(buffer[:ULAW_FRAME_BYTES])
+        del buffer[:ULAW_FRAME_BYTES]
+        next_send += ULAW_FRAME_INTERVAL
+    if buffer:
+        yield bytes(buffer)
 from ..services.audio_encoding import encode_audio, get_content_type, DEFAULT_SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
@@ -456,8 +519,12 @@ async def create_speech(
                 rtf = gen_time / audio_dur if audio_dur > 0 else 0
                 logger.info(f"TTS stream: First-Byte={first_chunk_time:.2f}s Gesamt={gen_time:.2f}s Audio={audio_dur:.2f}s RTF={rtf:.2f}x Chunks={chunk_count}")
 
+            stream = audio_stream()
+            if fmt == "ulaw_8000":
+                stream = pace_ulaw_stream(stream)
+
             return StreamingResponse(
-                audio_stream(),
+                stream,
                 media_type=content_type,
                 headers={
                     "Content-Disposition": f"attachment; filename=speech.{fmt}",
