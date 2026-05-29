@@ -29,64 +29,25 @@ from ..structures.schemas import (
 )
 from ..services.text_processing import normalize_text
 
-ULAW_CHUNK_BYTES = 1600     # 200ms per yield (10 × 160-byte frames) — amortizes ASGI overhead
-ULAW_CHUNK_INTERVAL = 0.200 # seconds
-ULAW_PREBUFFER_BYTES = 3200  # 400ms prebuffer — covers burst gaps; model RTF ~0.56 so no underruns
+ULAW_CHUNK_BYTES = 3200     # 400ms per yield — large chunks minimize ASGI overhead
 
 
 async def pace_ulaw_stream(audio_generator):
-    """Incremental real-time pacing for ulaw_8000 streaming.
+    """Pass ulaw_8000 chunks through as fast as they arrive.
 
-    Collects audio in a concurrent task (no backpressure on generator), buffers
-    400ms before starting playback to absorb the model's bursty emit pattern, then
-    drips 200ms chunks at real-time pace. Works because model RTF ~0.56 means it
-    generates 1.8x faster than real-time — buffer only grows after startup.
+    No server-side pacing: the agent already has a prebuffer that paces
+    frames to Telnyx at 20ms intervals. Server-side pacing was adding
+    audio_duration of extra latency to every turn (the agent waited for
+    the full real-time stream before it could reply).
+    Chunks are batched to 400ms (3200 bytes) to keep ASGI overhead low.
     """
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue = asyncio.Queue()
-
-    async def _collect():
-        async for chunk in audio_generator:
-            if chunk:
-                await queue.put(chunk)
-        await queue.put(None)
-
-    collector = asyncio.create_task(_collect())
     buffer = bytearray()
-    started = False
-    next_send = 0.0
-
-    try:
-        while True:
-            chunk = await asyncio.wait_for(queue.get(), timeout=30.0)
-            if chunk is None:
-                break
+    async for chunk in audio_generator:
+        if chunk:
             buffer.extend(chunk)
-
-            if not started and len(buffer) >= ULAW_PREBUFFER_BYTES:
-                started = True
-                next_send = loop.time()
-
-            if started:
-                while len(buffer) >= ULAW_CHUNK_BYTES:
-                    delay = next_send - loop.time()
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-                    yield bytes(buffer[:ULAW_CHUNK_BYTES])
-                    del buffer[:ULAW_CHUNK_BYTES]
-                    next_send += ULAW_CHUNK_INTERVAL
-    finally:
-        collector.cancel()
-
-    if not started:
-        next_send = loop.time()
-    while len(buffer) >= ULAW_CHUNK_BYTES:
-        delay = next_send - loop.time()
-        if delay > 0:
-            await asyncio.sleep(delay)
-        yield bytes(buffer[:ULAW_CHUNK_BYTES])
-        del buffer[:ULAW_CHUNK_BYTES]
-        next_send += ULAW_CHUNK_INTERVAL
+            while len(buffer) >= ULAW_CHUNK_BYTES:
+                yield bytes(buffer[:ULAW_CHUNK_BYTES])
+                del buffer[:ULAW_CHUNK_BYTES]
     if buffer:
         yield bytes(buffer)
 from ..services.audio_encoding import encode_audio, get_content_type, DEFAULT_SAMPLE_RATE
@@ -502,6 +463,7 @@ async def create_speech(
                     voice=voice_name,
                     language=language,
                     instruct=request.instruct,
+                    speed=request.speed,
                     model=request.model,
                 ):
                     if pcm_chunk is not None and len(pcm_chunk) > 0:

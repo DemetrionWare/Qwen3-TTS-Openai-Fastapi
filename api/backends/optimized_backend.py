@@ -296,15 +296,38 @@ class OptimizedQwen3TTSBackend:
         if voice.lower() in openai_mapping:
             voice_name = openai_mapping[voice.lower()]
 
-        for chunk, sr in self.model.stream_generate_custom_voice(
-            text=text,
-            speaker=voice_name,
-            language=language,
-            instruct=instruct,
-            emit_every_frames=emit_every_frames,
-            decode_window_frames=decode_window_frames,
-        ):
-            yield chunk, sr
+        if speed == 1.0:
+            for chunk, sr in self.model.stream_generate_custom_voice(
+                text=text,
+                speaker=voice_name,
+                language=language,
+                instruct=instruct,
+                emit_every_frames=emit_every_frames,
+                decode_window_frames=decode_window_frames,
+            ):
+                yield chunk, sr
+        else:
+            # Collect all PCM then apply time_stretch — chunk-level stretch causes artifacts
+            chunks = []
+            out_sr = 24000
+            for chunk, sr in self.model.stream_generate_custom_voice(
+                text=text,
+                speaker=voice_name,
+                language=language,
+                instruct=instruct,
+                emit_every_frames=emit_every_frames,
+                decode_window_frames=decode_window_frames,
+            ):
+                if chunk is not None and len(chunk) > 0:
+                    chunks.append(chunk)
+                    out_sr = sr
+            if chunks:
+                import librosa
+                audio = np.concatenate(chunks)
+                audio = librosa.effects.time_stretch(audio.astype(np.float32), rate=speed)
+                chunk_samples = out_sr // 5  # 200ms chunks
+                for i in range(0, len(audio), chunk_samples):
+                    yield audio[i:i + chunk_samples], out_sr
 
 
     async def generate_voice_clone(
