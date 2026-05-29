@@ -607,9 +607,15 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
     One connection per LLM turn: text chunks stream in, ulaw_8000 audio streams
     back continuously across sentence boundaries with no inter-sentence gap.
 
+    Supports clone: voice profiles:
+      wss://.../audio/speech/stream-input/clone:MyAgentVoice
+    Profile is loaded once at connect; voice prompt is cached across connections.
+    If the profile is not found the server closes with code 4404.
+
     Three concurrent tasks form the pipeline:
       _receive  -- WS text frames -> text_queue (None sentinel on EOS/disconnect)
-      _generate -- text_queue -> backend.generate_speech_streaming -> audio_queue
+      _generate -- text_queue -> backend.generate_speech_streaming (or
+                   generate_voice_clone_streaming for clone: voices) -> audio_queue
                    (encoded ulaw_8000 chunks; None sentinel when text exhausted)
       _send     -- audio_queue -> real-time-paced {"audio": ...} frames, then
                    {"isFinal": true} and close
@@ -638,7 +644,7 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
 
     # Shared config; first client message may override voice/model/language.
     state = {
-        "voice": get_voice_name(voice_id) if voice_id else "Vivian",
+        "voice": voice_id or "Vivian",
         "language": "Auto",
         "model": "tts-1",
     }
@@ -660,7 +666,7 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
                 if first:
                     first = False
                     if msg.get("voice"):
-                        state["voice"] = get_voice_name(msg["voice"])
+                        state["voice"] = msg["voice"]
                     if msg.get("model_id"):
                         state["model"] = msg["model_id"]
                     if msg.get("language"):
@@ -677,27 +683,84 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
             await text_queue.put(None)
 
     async def _generate():
-        """Generate ulaw_8000 chunks per text segment into audio_queue."""
+        """Generate ulaw_8000 chunks per text segment into audio_queue.
+
+        Supports both standard voices and clone: profiles. For clone: voices the
+        profile is loaded once per connection and the voice prompt is cached in the
+        backend across connections so the first sentence after a cold start is the
+        only slow one.
+        """
         try:
             backend = await get_tts_backend()
-            while True:
-                text = await text_queue.get()
-                if text is None:
-                    break
-                if not text.strip():
-                    continue
-                # Serialize GPU access for the duration of one segment.
-                async with _gpu_lock:
-                    async for pcm_chunk, sr in backend.generate_speech_streaming(
-                        text=text,
-                        voice=state["voice"],
-                        language=state["language"],
-                        model=state["model"],
-                    ):
-                        if pcm_chunk is not None and len(pcm_chunk) > 0:
-                            ulaw = encode_audio(pcm_chunk, "ulaw_8000", sr)
-                            await audio_queue.put(ulaw)
-                            await asyncio.sleep(0)
+            voice = state["voice"]
+
+            # --- Clone profile path ---
+            if voice.lower().startswith("clone:"):
+                profile_name = voice[6:].strip()
+                try:
+                    profile = _load_voice_profile(profile_name)
+                except ValueError as e:
+                    logger.error(f"WS clone: profile not found: {e}")
+                    await websocket.send_json({"error": "profile_not_found", "message": str(e)})
+                    await websocket.close(code=4404)
+                    return
+
+                # Load and cache reference audio (file I/O, once per connection)
+                ref_audio_path = profile["ref_audio_path"]
+                if profile_name in _ref_audio_cache:
+                    ref_audio, ref_sr = _ref_audio_cache[profile_name]
+                else:
+                    ref_audio, ref_sr = sf.read(ref_audio_path)
+                    if len(ref_audio.shape) > 1:
+                        ref_audio = ref_audio.mean(axis=1)
+                    ref_audio = ref_audio.astype(np.float32)
+                    _ref_audio_cache[profile_name] = (ref_audio, ref_sr)
+
+                clone_lang = state["language"] if state["language"] != "Auto" else profile["language"]
+                logger.info(f"WS clone: profile='{profile_name}' lang={clone_lang} xvec={profile['x_vector_only_mode']}")
+
+                while True:
+                    text = await text_queue.get()
+                    if text is None:
+                        break
+                    if not text.strip():
+                        continue
+                    async with _gpu_lock:
+                        async for pcm_chunk, sr in backend.generate_voice_clone_streaming(
+                            text=text,
+                            ref_audio=ref_audio,
+                            ref_audio_sr=ref_sr,
+                            ref_text=profile["ref_text"] or None,
+                            language=clone_lang,
+                            x_vector_only_mode=profile["x_vector_only_mode"],
+                            cache_key=profile_name,
+                        ):
+                            if pcm_chunk is not None and len(pcm_chunk) > 0:
+                                ulaw = encode_audio(pcm_chunk, "ulaw_8000", sr)
+                                await audio_queue.put(ulaw)
+                                await asyncio.sleep(0)
+
+            # --- Standard voice path ---
+            else:
+                voice_name = get_voice_name(voice)
+                while True:
+                    text = await text_queue.get()
+                    if text is None:
+                        break
+                    if not text.strip():
+                        continue
+                    async with _gpu_lock:
+                        async for pcm_chunk, sr in backend.generate_speech_streaming(
+                            text=text,
+                            voice=voice_name,
+                            language=state["language"],
+                            model=state["model"],
+                        ):
+                            if pcm_chunk is not None and len(pcm_chunk) > 0:
+                                ulaw = encode_audio(pcm_chunk, "ulaw_8000", sr)
+                                await audio_queue.put(ulaw)
+                                await asyncio.sleep(0)
+
         except Exception as e:
             logger.exception(f"WS stream-input generate error: {e}")
         finally:
