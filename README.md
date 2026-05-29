@@ -7,7 +7,18 @@ Based on [groxaxo/Qwen3-TTS-Openai-Fastapi](https://github.com/groxaxo/Qwen3-TTS
 and [dffdeeq/Qwen3-TTS-streaming](https://github.com/dffdeeq/Qwen3-TTS-streaming).
 
 
-## What this fork adds
+## What this fork adds (DemetrionWare)
+
+- **`ulaw_8000` response format** — streams raw G.711 μ-law 8 kHz mono, ready for
+  Telnyx with no client-side conversion. Pass `response_format: "ulaw_8000"` with
+  `stream: true`. 0.7s TTFB, 5.5× smaller payload than 24 kHz PCM.
+- **1.7B-CustomVoice default** — model mapping updated to use the 1.7B model for all
+  request types (`tts-1`, `tts-1-hd`, `qwen3-tts`).
+- **Vast.ai onstart script** — see [`scripts/vast-qwen3-tts-caddy-cloudflare.sh`](scripts/vast-qwen3-tts-caddy-cloudflare.sh)
+  for a complete onstart that installs deps, configures the server, and starts Caddy +
+  Cloudflare Tunnel on reboot.
+
+## What dingausmwald's fork adds
 
 - **Real-time audio streaming** — `stream: true` in the request body yields PCM
   chunks as the model generates them, instead of waiting for the full audio.
@@ -62,19 +73,25 @@ The server listens on port **8880** by default.
 
 ```bash
 # Non-streaming (compatible with OpenWebUI, SillyTavern, etc.)
-curl -X POST http://localhost:8880/v1/audio/speech \
+curl -X POST http://localhost:11435/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{"input": "Hello world!", "voice": "alloy", "model": "tts-1"}' \
   --output speech.mp3
 
-# Real-time streaming (for low-latency applications)
-curl -X POST http://localhost:8880/v1/audio/speech \
+# Real-time streaming PCM (24 kHz)
+curl -X POST http://localhost:11435/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{"input": "Hello world!", "voice": "alloy", "model": "tts-1", "stream": true, "response_format": "pcm"}' \
   --output speech.pcm
 
+# Real-time streaming μ-law 8 kHz (Telnyx / telephony)
+curl -X POST http://localhost:11435/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"input": "Hello world!", "voice": "alloy", "model": "tts-1", "stream": true, "response_format": "ulaw_8000"}' \
+  --output speech.ul
+
 # Voice cloning (auto-switches to Base model)
-curl -X POST http://localhost:8880/v1/audio/speech \
+curl -X POST http://localhost:11435/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{"input": "Hello world!", "voice": "clone:MyVoice", "model": "tts-1-en"}' \
   --output speech.mp3
