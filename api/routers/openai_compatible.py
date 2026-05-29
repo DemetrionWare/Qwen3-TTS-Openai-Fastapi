@@ -642,12 +642,20 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
 
     loop = asyncio.get_running_loop()
 
-    # Shared config; first client message may override voice/model/language.
+    # Shared config populated from the first control frame.
     state = {
         "voice": voice_id or "Vivian",
         "language": "Auto",
         "model": "tts-1",
+        "ref_audio": None,      # base64 string, set by first frame
+        "ref_text": None,
+        "x_vector_only_mode": False,
+        "voice_id": voice_id,   # cache key hint from URL
     }
+
+    # _generate waits on this before reading state so there is no race with
+    # _receive processing the first (config) frame.
+    config_ready: asyncio.Event = asyncio.Event()
 
     text_queue: asyncio.Queue = asyncio.Queue()
     audio_queue: asyncio.Queue = asyncio.Queue()
@@ -662,15 +670,26 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
                     msg = json.loads(raw)
                 except (json.JSONDecodeError, TypeError):
                     logger.warning("WS stream-input: skipping non-JSON frame")
+                    if first:
+                        config_ready.set()
                     continue
                 if first:
                     first = False
                     if msg.get("voice"):
                         state["voice"] = msg["voice"]
+                    if msg.get("voice_id"):
+                        state["voice_id"] = msg["voice_id"]
                     if msg.get("model_id"):
                         state["model"] = msg["model_id"]
                     if msg.get("language"):
                         state["language"] = msg["language"]
+                    if msg.get("ref_audio"):
+                        state["ref_audio"] = msg["ref_audio"]
+                    if msg.get("ref_text") is not None:
+                        state["ref_text"] = msg["ref_text"]
+                    if msg.get("x_vector_only_mode") is not None:
+                        state["x_vector_only_mode"] = bool(msg["x_vector_only_mode"])
+                    config_ready.set()
                 text = msg.get("text", "")
                 if text == "":
                     break  # empty text = EOS
@@ -680,22 +699,69 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
         except Exception as e:
             logger.warning(f"WS stream-input receive error: {e}")
         finally:
+            config_ready.set()  # unblock _generate even on early disconnect
             await text_queue.put(None)
 
     async def _generate():
         """Generate ulaw_8000 chunks per text segment into audio_queue.
 
-        Supports both standard voices and clone: profiles. For clone: voices the
-        profile is loaded once per connection and the voice prompt is cached in the
-        backend across connections so the first sentence after a cold start is the
-        only slow one.
+        Three voice modes, resolved after the first frame is received:
+          1. ref-at-connect: ref_audio in first frame — decode once, stream all
+             sentences through that voice. voice_id (if given) is used as the
+             cache key so the voice prompt survives across connections on warm boxes.
+          2. clone:Name    : look up a pre-provisioned disk profile.
+          3. standard      : CustomVoice / built-in voice (existing behaviour).
         """
         try:
             backend = await get_tts_backend()
+
+            # Wait until _receive has processed the first frame so state is final.
+            await config_ready.wait()
+
             voice = state["voice"]
 
-            # --- Clone profile path ---
-            if voice.lower().startswith("clone:"):
+            # --- Path 1: ref_audio supplied in first frame ---
+            if state.get("ref_audio"):
+                ref_b64 = state["ref_audio"]
+                if ref_b64.startswith("data:"):
+                    ref_b64 = ref_b64.split(",", 1)[1]
+                raw_bytes = base64.b64decode(ref_b64)
+                ref_audio, ref_sr = sf.read(io.BytesIO(raw_bytes))
+                if len(ref_audio.shape) > 1:
+                    ref_audio = ref_audio.mean(axis=1)
+                ref_audio = ref_audio.astype(np.float32)
+                ref_text = state.get("ref_text") or None
+                x_vector_only = state.get("x_vector_only_mode", False)
+                clone_lang = state["language"]
+                # Optional stable cache key: voice_id from URL or first frame.
+                cache_key = state.get("voice_id") or None
+                if cache_key:
+                    _ref_audio_cache[cache_key] = (ref_audio, ref_sr)
+                logger.info(f"WS clone (ref-at-connect): cache_key={cache_key} lang={clone_lang} xvec={x_vector_only}")
+
+                while True:
+                    text = await text_queue.get()
+                    if text is None:
+                        break
+                    if not text.strip():
+                        continue
+                    async with _gpu_lock:
+                        async for pcm_chunk, sr in backend.generate_voice_clone_streaming(
+                            text=text,
+                            ref_audio=ref_audio,
+                            ref_audio_sr=ref_sr,
+                            ref_text=ref_text,
+                            language=clone_lang,
+                            x_vector_only_mode=x_vector_only,
+                            cache_key=cache_key,
+                        ):
+                            if pcm_chunk is not None and len(pcm_chunk) > 0:
+                                ulaw = encode_audio(pcm_chunk, "ulaw_8000", sr)
+                                await audio_queue.put(ulaw)
+                                await asyncio.sleep(0)
+
+            # --- Path 2: clone:Name disk profile ---
+            elif voice.lower().startswith("clone:"):
                 profile_name = voice[6:].strip()
                 try:
                     profile = _load_voice_profile(profile_name)
@@ -705,19 +771,17 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
                     await websocket.close(code=4404)
                     return
 
-                # Load and cache reference audio (file I/O, once per connection)
-                ref_audio_path = profile["ref_audio_path"]
                 if profile_name in _ref_audio_cache:
                     ref_audio, ref_sr = _ref_audio_cache[profile_name]
                 else:
-                    ref_audio, ref_sr = sf.read(ref_audio_path)
+                    ref_audio, ref_sr = sf.read(profile["ref_audio_path"])
                     if len(ref_audio.shape) > 1:
                         ref_audio = ref_audio.mean(axis=1)
                     ref_audio = ref_audio.astype(np.float32)
                     _ref_audio_cache[profile_name] = (ref_audio, ref_sr)
 
                 clone_lang = state["language"] if state["language"] != "Auto" else profile["language"]
-                logger.info(f"WS clone: profile='{profile_name}' lang={clone_lang} xvec={profile['x_vector_only_mode']}")
+                logger.info(f"WS clone (disk profile): profile='{profile_name}' lang={clone_lang} xvec={profile['x_vector_only_mode']}")
 
                 while True:
                     text = await text_queue.get()
@@ -740,7 +804,7 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
                                 await audio_queue.put(ulaw)
                                 await asyncio.sleep(0)
 
-            # --- Standard voice path ---
+            # --- Path 3: standard built-in voice ---
             else:
                 voice_name = get_voice_name(voice)
                 while True:
