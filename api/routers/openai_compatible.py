@@ -647,10 +647,11 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
         "voice": voice_id or "Vivian",
         "language": "Auto",
         "model": "tts-1",
-        "ref_audio": None,      # base64 string, set by first frame
+        "ref_audio": None,        # base64 string, set by first frame
         "ref_text": None,
         "x_vector_only_mode": False,
-        "voice_id": voice_id,   # cache key hint from URL
+        "voice_id": voice_id,     # cache key hint from URL
+        "response_format": "ulaw_8000",  # ulaw_8000 | pcm | mp3 | opus | wav | aac
     }
 
     # _generate waits on this before reading state so there is no race with
@@ -689,6 +690,8 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
                         state["ref_text"] = msg["ref_text"]
                     if msg.get("x_vector_only_mode") is not None:
                         state["x_vector_only_mode"] = bool(msg["x_vector_only_mode"])
+                    if msg.get("response_format"):
+                        state["response_format"] = msg["response_format"]
                     config_ready.set()
                 text = msg.get("text", "")
                 if text == "":
@@ -719,6 +722,7 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
             await config_ready.wait()
 
             voice = state["voice"]
+            fmt = state["response_format"]
 
             # --- Path 1: ref_audio supplied in first frame ---
             if state.get("ref_audio"):
@@ -756,8 +760,8 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
                             cache_key=cache_key,
                         ):
                             if pcm_chunk is not None and len(pcm_chunk) > 0:
-                                ulaw = encode_audio(pcm_chunk, "ulaw_8000", sr)
-                                await audio_queue.put(ulaw)
+                                encoded = encode_audio(pcm_chunk, fmt, sr)
+                                await audio_queue.put(encoded)
                                 await asyncio.sleep(0)
 
             # --- Path 2: clone:Name disk profile ---
@@ -800,8 +804,8 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
                             cache_key=profile_name,
                         ):
                             if pcm_chunk is not None and len(pcm_chunk) > 0:
-                                ulaw = encode_audio(pcm_chunk, "ulaw_8000", sr)
-                                await audio_queue.put(ulaw)
+                                encoded = encode_audio(pcm_chunk, fmt, sr)
+                                await audio_queue.put(encoded)
                                 await asyncio.sleep(0)
 
             # --- Path 3: standard built-in voice ---
@@ -821,8 +825,8 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
                             model=state["model"],
                         ):
                             if pcm_chunk is not None and len(pcm_chunk) > 0:
-                                ulaw = encode_audio(pcm_chunk, "ulaw_8000", sr)
-                                await audio_queue.put(ulaw)
+                                encoded = encode_audio(pcm_chunk, fmt, sr)
+                                await audio_queue.put(encoded)
                                 await asyncio.sleep(0)
 
         except Exception as e:
@@ -831,12 +835,15 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
             await audio_queue.put(None)
 
     async def _send():
-        """Pace ulaw_8000 at real-time (1600 bytes / 200ms), then isFinal + close.
+        """Send audio chunks to client, then isFinal + close.
 
-        Same pacing logic as pace_ulaw_stream: never deliver more than 200ms of
-        audio ahead of real time, so the downstream Telnyx pipeline doesn't get a
-        burst that compresses the start of each utterance.
+        For ulaw_8000: real-time paced at 200ms intervals so Telnyx doesn't get
+        a burst at the start of each utterance.
+        For all other formats: send chunks as fast as they arrive — the client
+        buffers (mobile AudioTrack, Web Audio API, etc.).
         """
+        fmt = state["response_format"]
+        pace = fmt == "ulaw_8000"
         buffer = bytearray()
         next_send = None
 
@@ -848,11 +855,16 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
                 chunk = await audio_queue.get()
                 if chunk is None:
                     break
-                buffer.extend(chunk)
 
+                if not pace:
+                    # Non-ulaw: send immediately as chunks arrive
+                    await _emit(chunk)
+                    continue
+
+                # ulaw_8000: pace at real-time
+                buffer.extend(chunk)
                 if next_send is None and len(buffer) >= ULAW_CHUNK_BYTES:
                     next_send = loop.time()
-
                 if next_send is not None:
                     while len(buffer) >= ULAW_CHUNK_BYTES:
                         delay = next_send - loop.time()
@@ -862,18 +874,19 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
                         del buffer[:ULAW_CHUNK_BYTES]
                         next_send += ULAW_CHUNK_INTERVAL
 
-            # Flush remainder at the same paced rate.
-            if next_send is None:
-                next_send = loop.time()
-            while len(buffer) >= ULAW_CHUNK_BYTES:
-                delay = next_send - loop.time()
-                if delay > 0:
-                    await asyncio.sleep(delay)
-                await _emit(bytes(buffer[:ULAW_CHUNK_BYTES]))
-                del buffer[:ULAW_CHUNK_BYTES]
-                next_send += ULAW_CHUNK_INTERVAL
-            if buffer:
-                await _emit(bytes(buffer))
+            # Flush ulaw remainder
+            if pace:
+                if next_send is None:
+                    next_send = loop.time()
+                while len(buffer) >= ULAW_CHUNK_BYTES:
+                    delay = next_send - loop.time()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    await _emit(bytes(buffer[:ULAW_CHUNK_BYTES]))
+                    del buffer[:ULAW_CHUNK_BYTES]
+                    next_send += ULAW_CHUNK_INTERVAL
+                if buffer:
+                    await _emit(bytes(buffer))
 
             await websocket.send_json({"isFinal": True})
         except WebSocketDisconnect:
