@@ -342,7 +342,7 @@ class OptimizedQwen3TTSBackend:
         cache_key: Optional[str] = None,
     ) -> Tuple[np.ndarray, int]:
         """Voice cloning uses the configured CustomVoice model."""
-        await self._ensure_model_loaded(self._get_model_key_for_request("qwen3-tts"))
+        await self._ensure_model_loaded(self.config.get("default_model", "1.7B-Base"))
 
         import time as _time
 
@@ -406,7 +406,7 @@ class OptimizedQwen3TTSBackend:
 
         Yields (pcm_chunk, sample_rate) tuples as audio is generated.
         """
-        await self._ensure_model_loaded(self._get_model_key_for_request("qwen3-tts"))
+        await self._ensure_model_loaded(self.config.get("default_model", "1.7B-Base"))
 
         import time as _time
 
