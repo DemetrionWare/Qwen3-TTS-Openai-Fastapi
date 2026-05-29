@@ -451,15 +451,25 @@ async def create_speech(
         if request.task_type == "Base" and request.ref_audio:
             backend = await get_tts_backend()
 
-            ref_audio_data = request.ref_audio
-            if ref_audio_data.startswith("data:"):
-                ref_audio_data = ref_audio_data.split(",", 1)[1]
-            audio_bytes_raw = base64.b64decode(ref_audio_data)
-            audio_buffer = io.BytesIO(audio_bytes_raw)
-            ref_audio, ref_sr = sf.read(audio_buffer)
-            if len(ref_audio.shape) > 1:
-                ref_audio = ref_audio.mean(axis=1)
-            ref_audio = ref_audio.astype(np.float32)
+            # Use voice name as cache key so repeated calls for the same voice
+            # reuse the cached voice prompt (skips ~1s create_voice_clone_prompt).
+            http_cache_key = request.voice if request.voice else None
+
+            # Decode and cache the reference audio array per voice.
+            if http_cache_key and http_cache_key in _ref_audio_cache:
+                ref_audio, ref_sr = _ref_audio_cache[http_cache_key]
+            else:
+                ref_audio_data = request.ref_audio
+                if ref_audio_data.startswith("data:"):
+                    ref_audio_data = ref_audio_data.split(",", 1)[1]
+                audio_bytes_raw = base64.b64decode(ref_audio_data)
+                audio_buffer = io.BytesIO(audio_bytes_raw)
+                ref_audio, ref_sr = sf.read(audio_buffer)
+                if len(ref_audio.shape) > 1:
+                    ref_audio = ref_audio.mean(axis=1)
+                ref_audio = ref_audio.astype(np.float32)
+                if http_cache_key:
+                    _ref_audio_cache[http_cache_key] = (ref_audio, ref_sr)
 
             logger.info(f"Voice clone: lang={language}, ref_text={request.ref_text is not None}, xvec_only={request.x_vector_only_mode}")
 
@@ -472,6 +482,7 @@ async def create_speech(
                 language=language,
                 x_vector_only_mode=request.x_vector_only_mode or False,
                 speed=request.speed,
+                cache_key=http_cache_key,
             )
             gen_time = time.time() - gen_start
 
