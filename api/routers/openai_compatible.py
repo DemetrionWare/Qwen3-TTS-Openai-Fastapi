@@ -29,17 +29,18 @@ from ..structures.schemas import (
 )
 from ..services.text_processing import normalize_text
 
-ULAW_FRAME_BYTES = 160      # 20ms at 8kHz mono
-ULAW_FRAME_INTERVAL = 0.020 # seconds
-ULAW_PREBUFFER_BYTES = 6400  # 800ms before starting playback — covers burst gaps
+ULAW_CHUNK_BYTES = 1600     # 200ms per yield (10 × 160-byte frames) — amortizes ASGI overhead
+ULAW_CHUNK_INTERVAL = 0.200 # seconds
+ULAW_PREBUFFER_BYTES = 3200  # 400ms prebuffer — covers burst gaps; model RTF ~0.56 so no underruns
 
 
 async def pace_ulaw_stream(audio_generator):
-    """Buffer then pace ulaw_8000 output at real-time (160 bytes / 20ms).
+    """Incremental real-time pacing for ulaw_8000 streaming.
 
-    Runs audio collection in a concurrent task so the model keeps generating
-    while we sleep between frames — no backpressure on the generator.
-    Accumulates 800ms before starting playback to cover the model's burst gaps.
+    Collects audio in a concurrent task (no backpressure on generator), buffers
+    400ms before starting playback to absorb the model's bursty emit pattern, then
+    drips 200ms chunks at real-time pace. Works because model RTF ~0.56 means it
+    generates 1.8x faster than real-time — buffer only grows after startup.
     """
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
@@ -48,10 +49,9 @@ async def pace_ulaw_stream(audio_generator):
         async for chunk in audio_generator:
             if chunk:
                 await queue.put(chunk)
-        await queue.put(None)  # sentinel
+        await queue.put(None)
 
     collector = asyncio.create_task(_collect())
-
     buffer = bytearray()
     started = False
     next_send = 0.0
@@ -61,7 +61,6 @@ async def pace_ulaw_stream(audio_generator):
             chunk = await asyncio.wait_for(queue.get(), timeout=30.0)
             if chunk is None:
                 break
-
             buffer.extend(chunk)
 
             if not started and len(buffer) >= ULAW_PREBUFFER_BYTES:
@@ -69,26 +68,25 @@ async def pace_ulaw_stream(audio_generator):
                 next_send = loop.time()
 
             if started:
-                while len(buffer) >= ULAW_FRAME_BYTES:
+                while len(buffer) >= ULAW_CHUNK_BYTES:
                     delay = next_send - loop.time()
                     if delay > 0:
                         await asyncio.sleep(delay)
-                    yield bytes(buffer[:ULAW_FRAME_BYTES])
-                    del buffer[:ULAW_FRAME_BYTES]
-                    next_send += ULAW_FRAME_INTERVAL
+                    yield bytes(buffer[:ULAW_CHUNK_BYTES])
+                    del buffer[:ULAW_CHUNK_BYTES]
+                    next_send += ULAW_CHUNK_INTERVAL
     finally:
         collector.cancel()
 
-    # Drain remainder
     if not started:
         next_send = loop.time()
-    while len(buffer) >= ULAW_FRAME_BYTES:
+    while len(buffer) >= ULAW_CHUNK_BYTES:
         delay = next_send - loop.time()
         if delay > 0:
             await asyncio.sleep(delay)
-        yield bytes(buffer[:ULAW_FRAME_BYTES])
-        del buffer[:ULAW_FRAME_BYTES]
-        next_send += ULAW_FRAME_INTERVAL
+        yield bytes(buffer[:ULAW_CHUNK_BYTES])
+        del buffer[:ULAW_CHUNK_BYTES]
+        next_send += ULAW_CHUNK_INTERVAL
     if buffer:
         yield bytes(buffer)
 from ..services.audio_encoding import encode_audio, get_content_type, DEFAULT_SAMPLE_RATE

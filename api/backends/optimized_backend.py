@@ -121,7 +121,6 @@ class OptimizedQwen3TTSBackend:
                     compile_mode=opt.get("compile_mode", "max-autotune"),
                     use_fast_codebook=opt.get("use_fast_codebook", True),
                     compile_codebook_predictor=opt.get("compile_codebook_predictor", True),
-                    compile_talker=opt.get("compile_talker", False),
                 )
                 logger.info(f"torch.compile enabled: mode={opt.get('compile_mode', 'max-autotune')}, fast_codebook={opt.get('use_fast_codebook', True)}")
 
