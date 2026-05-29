@@ -68,7 +68,16 @@ class OptimizedQwen3TTSBackend:
 
         model_info = self.config.get("models", {}).get(model_key, {})
         if not model_info:
-            raise ValueError(f"Unknown model: {model_key}")
+            # Requested model not configured — fall back to default rather than
+            # switching (which would unload the current model + clear voice cache).
+            default = self.config.get("default_model")
+            if default and default != model_key:
+                if self.current_model_key == default and self.model is not None:
+                    return  # already on default, stay put
+                model_key = default
+                model_info = self.config.get("models", {}).get(model_key, {})
+            if not model_info:
+                raise ValueError(f"Unknown model: {model_key}")
 
         hf_id = model_info["hf_id"]
 
@@ -226,6 +235,54 @@ class OptimizedQwen3TTSBackend:
         self.current_model_key = model_key
         self._ready = True
         logger.info(f"Model {model_key} ready on {self.device}")
+
+        # Pre-warm voice prompts for all disk profiles so the first real call
+        # is cache-warm. Only runs for the base model (which supports cloning).
+        if model_info.get("type") == "base":
+            self._preload_voice_profiles()
+
+    def _preload_voice_profiles(self) -> None:
+        """Build and cache voice prompts for all profiles in the voice library.
+
+        Called once after model warmup. Errors are non-fatal — a miss on the
+        first live call will still build+cache the prompt, just adds ~1s cold cost.
+        """
+        import time as _time
+        import soundfile as _sf
+        voice_lib = Path(os.environ.get("VOICE_LIBRARY_DIR", "./voice_library")).resolve()
+        profiles_dir = voice_lib / "profiles"
+        if not profiles_dir.exists():
+            return
+        for child in sorted(profiles_dir.iterdir()):
+            meta_file = child / "meta.json"
+            if not meta_file.exists():
+                continue
+            try:
+                import json as _json
+                meta = _json.loads(meta_file.read_text(encoding="utf-8"))
+                ref_filename = meta.get("ref_audio_filename", "")
+                if not ref_filename:
+                    continue
+                ref_path = child / ref_filename
+                if not ref_path.exists():
+                    continue
+                cache_key = meta.get("name") or meta.get("profile_id")
+                if not cache_key or cache_key in self._voice_prompt_cache:
+                    continue
+                ref_audio, ref_sr = _sf.read(str(ref_path))
+                if len(ref_audio.shape) > 1:
+                    ref_audio = ref_audio.mean(axis=1)
+                ref_audio = ref_audio.astype(np.float32)
+                t0 = _time.time()
+                prompt_items = self.model.create_voice_clone_prompt(
+                    ref_audio=(ref_audio, ref_sr),
+                    ref_text=meta.get("ref_text") or None,
+                    x_vector_only_mode=meta.get("x_vector_only_mode", False),
+                )
+                self._voice_prompt_cache[cache_key] = prompt_items
+                logger.info(f"Pre-warmed voice prompt: '{cache_key}' ({_time.time()-t0:.2f}s)")
+            except Exception as e:
+                logger.warning(f"Pre-warm failed for '{child.name}': {e}")
 
     async def initialize(self, model_key: Optional[str] = None) -> None:
         """Initialize with default or specified model."""
