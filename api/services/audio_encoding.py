@@ -14,7 +14,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-AudioFormat = Literal["mp3", "opus", "aac", "flac", "wav", "pcm"]
+AudioFormat = Literal["mp3", "opus", "aac", "flac", "wav", "pcm", "ulaw_8000"]
 
 # Default sample rate for Qwen3-TTS output
 DEFAULT_SAMPLE_RATE = 24000
@@ -29,6 +29,7 @@ def get_content_type(audio_format: AudioFormat) -> str:
         "flac": "audio/flac",
         "wav": "audio/wav",
         "pcm": "audio/pcm",
+        "ulaw_8000": "audio/PCMU",
     }
     return content_types.get(audio_format, f"audio/{audio_format}")
 
@@ -124,6 +125,30 @@ def convert_to_pcm(
     return audio_int16.tobytes()
 
 
+def convert_to_ulaw(
+    audio: np.ndarray,
+    src_sample_rate: int = DEFAULT_SAMPLE_RATE,
+) -> bytes:
+    """Resample to 8 kHz mono and encode as G.711 μ-law (ulaw_8000)."""
+    import audioop
+    from math import gcd
+    from scipy.signal import resample_poly
+
+    if audio.dtype != np.float32:
+        audio = audio.astype(np.float32)
+    max_val = np.max(np.abs(audio))
+    if max_val > 1.0:
+        audio = audio / max_val
+
+    g = gcd(8000, src_sample_rate)
+    audio_8k = resample_poly(audio, 8000 // g, src_sample_rate // g)
+
+    pcm16 = np.clip(audio_8k, -1.0, 1.0)
+    pcm16 = (pcm16 * 32767).astype(np.int16)
+
+    return audioop.lin2ulaw(pcm16.tobytes(), 2)
+
+
 def encode_audio(
     audio: np.ndarray,
     format: AudioFormat = "mp3",
@@ -142,9 +167,12 @@ def encode_audio(
     """
     if format == "wav":
         return convert_to_wav(audio, sample_rate)
-    
+
     if format == "pcm":
         return convert_to_pcm(audio)
+
+    if format == "ulaw_8000":
+        return convert_to_ulaw(audio, sample_rate)
     
     # For compressed formats, use pydub if available, otherwise fall back to wav
     try:

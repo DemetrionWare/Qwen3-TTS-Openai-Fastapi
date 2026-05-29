@@ -57,7 +57,7 @@ class OpenAISpeechRequest(BaseModel):
         default="Vivian",
         description="The voice to use for generation. Available voices depend on the loaded model.",
     )
-    response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = Field(
+    response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm", "ulaw_8000"] = Field(
         default="mp3",
         description="The format to return audio in. Supported formats: mp3, opus, aac, flac, wav, pcm.",
     )
@@ -144,7 +144,7 @@ class VoiceCloneRequest(BaseModel):
         default="Auto",
         description="Language code for TTS. If not provided, will auto-detect.",
     )
-    response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = Field(
+    response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm", "ulaw_8000"] = Field(
         default="mp3",
         description="The format to return audio in.",
     )

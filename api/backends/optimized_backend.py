@@ -22,9 +22,9 @@ def load_config() -> dict:
 
 # Model mapping: OpenAI model name -> our model key
 MODEL_MAPPING = {
-    "tts-1": "0.6B-CustomVoice",
+    "tts-1": "1.7B-CustomVoice",
     "tts-1-hd": "1.7B-CustomVoice",
-    "qwen3-tts": "0.6B-CustomVoice",
+    "qwen3-tts": "1.7B-CustomVoice",
     "qwen3-tts-hd": "1.7B-CustomVoice",
 }
 
