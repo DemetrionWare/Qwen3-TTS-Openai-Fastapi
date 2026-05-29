@@ -925,7 +925,10 @@ async def create_voice_clone(
             )
 
         try:
-            audio_bytes = base64.b64decode(request.ref_audio)
+            ref_audio_b64 = request.ref_audio
+            if ref_audio_b64.startswith("data:"):
+                ref_audio_b64 = ref_audio_b64.split(",", 1)[1]
+            audio_bytes = base64.b64decode(ref_audio_b64)
         except Exception as e:
             raise HTTPException(
                 status_code=400,
