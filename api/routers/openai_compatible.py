@@ -693,9 +693,11 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
                     if msg.get("response_format"):
                         state["response_format"] = msg["response_format"]
                     config_ready.set()
-                text = msg.get("text", "")
+                text = msg.get("text")  # None = key absent (config-only frame), "" = EOS
+                if text is None:
+                    continue  # config-only frame, no text to enqueue
                 if text == "":
-                    break  # empty text = EOS
+                    break  # EOS
                 await text_queue.put(text)
         except WebSocketDisconnect:
             pass
