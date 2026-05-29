@@ -17,7 +17,7 @@ from typing import List, Optional
 
 import numpy as np
 import soundfile as sf
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 
 from ..structures.schemas import (
@@ -101,6 +101,14 @@ router = APIRouter(
 # GPU lock: serializes TTS generation to prevent GPU contention
 # (pattern from groxaxo vllm_omni backend)
 _gpu_lock = asyncio.Lock()
+
+# API key for the WebSocket stream-input endpoint. The Caddy proxy in front of
+# this server already enforces auth on the HTTP path; the WS endpoint enforces
+# it here too so a direct (non-proxied) connection still requires a credential.
+# Accepts either the ElevenLabs-style `xi-api-key` header or `Authorization:
+# Bearer <token>`. If no key is configured in the environment, any non-empty
+# credential is accepted (the proxy is then the source of truth).
+EXPECTED_API_KEY = os.environ.get("TTS_API_KEY") or os.environ.get("API_KEY")
 
 # Voice library directory (same as VOICE_LIBRARY_DIR in start_server.sh)
 VOICE_LIBRARY_DIR = Path(os.environ.get("VOICE_LIBRARY_DIR", "./voice_library")).resolve()
@@ -580,6 +588,187 @@ async def create_speech(
                 "type": "server_error",
             },
         )
+
+
+@router.websocket("/audio/speech/stream-input")
+@router.websocket("/audio/speech/stream-input/{voice_id}")
+async def websocket_tts_stream(websocket: WebSocket, voice_id: str = "Vivian"):
+    """ElevenLabs-compatible bidirectional streaming TTS over WebSocket.
+
+    Protocol (matches wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input):
+
+      Client -> Server:  {"text": "Hello. ", "try_trigger_generation": true}
+                         {"text": "Next sentence. "}
+                         {"text": ""}            # empty text = EOS, flush + close
+      Server -> Client:  {"audio": "<base64 ulaw_8000 bytes>"}
+                         ...
+                         {"isFinal": true}
+
+    One connection per LLM turn: text chunks stream in, ulaw_8000 audio streams
+    back continuously across sentence boundaries with no inter-sentence gap.
+
+    Three concurrent tasks form the pipeline:
+      _receive  -- WS text frames -> text_queue (None sentinel on EOS/disconnect)
+      _generate -- text_queue -> backend.generate_speech_streaming -> audio_queue
+                   (encoded ulaw_8000 chunks; None sentinel when text exhausted)
+      _send     -- audio_queue -> real-time-paced {"audio": ...} frames, then
+                   {"isFinal": true} and close
+    """
+    # --- Auth: accept `xi-api-key` OR `Authorization: Bearer <token>` ---
+    xi_key = websocket.headers.get("xi-api-key")
+    auth_header = websocket.headers.get("authorization", "")
+    bearer = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else None
+    provided = xi_key or bearer
+    if EXPECTED_API_KEY:
+        authorized = provided == EXPECTED_API_KEY
+    else:
+        # No server-side key configured: the Caddy proxy is the source of truth,
+        # so just require that *some* credential was passed through.
+        authorized = bool(provided)
+    if not authorized:
+        # Complete the handshake first so a real 1008 (policy violation) close
+        # frame is delivered to the client, rather than a pre-accept HTTP 403.
+        await websocket.accept()
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+
+    loop = asyncio.get_running_loop()
+
+    # Shared config; first client message may override voice/model/language.
+    state = {
+        "voice": get_voice_name(voice_id) if voice_id else "Vivian",
+        "language": "Auto",
+        "model": "tts-1",
+    }
+
+    text_queue: asyncio.Queue = asyncio.Queue()
+    audio_queue: asyncio.Queue = asyncio.Queue()
+
+    async def _receive():
+        """Read JSON text frames into text_queue; sentinel on EOS/disconnect."""
+        first = True
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                try:
+                    msg = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("WS stream-input: skipping non-JSON frame")
+                    continue
+                if first:
+                    first = False
+                    if msg.get("voice"):
+                        state["voice"] = get_voice_name(msg["voice"])
+                    if msg.get("model_id"):
+                        state["model"] = msg["model_id"]
+                    if msg.get("language"):
+                        state["language"] = msg["language"]
+                text = msg.get("text", "")
+                if text == "":
+                    break  # empty text = EOS
+                await text_queue.put(text)
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.warning(f"WS stream-input receive error: {e}")
+        finally:
+            await text_queue.put(None)
+
+    async def _generate():
+        """Generate ulaw_8000 chunks per text segment into audio_queue."""
+        try:
+            backend = await get_tts_backend()
+            while True:
+                text = await text_queue.get()
+                if text is None:
+                    break
+                if not text.strip():
+                    continue
+                # Serialize GPU access for the duration of one segment.
+                async with _gpu_lock:
+                    async for pcm_chunk, sr in backend.generate_speech_streaming(
+                        text=text,
+                        voice=state["voice"],
+                        language=state["language"],
+                        model=state["model"],
+                    ):
+                        if pcm_chunk is not None and len(pcm_chunk) > 0:
+                            ulaw = encode_audio(pcm_chunk, "ulaw_8000", sr)
+                            await audio_queue.put(ulaw)
+                            await asyncio.sleep(0)
+        except Exception as e:
+            logger.exception(f"WS stream-input generate error: {e}")
+        finally:
+            await audio_queue.put(None)
+
+    async def _send():
+        """Pace ulaw_8000 at real-time (1600 bytes / 200ms), then isFinal + close.
+
+        Same pacing logic as pace_ulaw_stream: never deliver more than 200ms of
+        audio ahead of real time, so the downstream Telnyx pipeline doesn't get a
+        burst that compresses the start of each utterance.
+        """
+        buffer = bytearray()
+        next_send = None
+
+        async def _emit(data: bytes):
+            await websocket.send_json({"audio": base64.b64encode(data).decode()})
+
+        try:
+            while True:
+                chunk = await audio_queue.get()
+                if chunk is None:
+                    break
+                buffer.extend(chunk)
+
+                if next_send is None and len(buffer) >= ULAW_CHUNK_BYTES:
+                    next_send = loop.time()
+
+                if next_send is not None:
+                    while len(buffer) >= ULAW_CHUNK_BYTES:
+                        delay = next_send - loop.time()
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                        await _emit(bytes(buffer[:ULAW_CHUNK_BYTES]))
+                        del buffer[:ULAW_CHUNK_BYTES]
+                        next_send += ULAW_CHUNK_INTERVAL
+
+            # Flush remainder at the same paced rate.
+            if next_send is None:
+                next_send = loop.time()
+            while len(buffer) >= ULAW_CHUNK_BYTES:
+                delay = next_send - loop.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                await _emit(bytes(buffer[:ULAW_CHUNK_BYTES]))
+                del buffer[:ULAW_CHUNK_BYTES]
+                next_send += ULAW_CHUNK_INTERVAL
+            if buffer:
+                await _emit(bytes(buffer))
+
+            await websocket.send_json({"isFinal": True})
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.warning(f"WS stream-input send error: {e}")
+
+    recv_task = asyncio.create_task(_receive())
+    gen_task = asyncio.create_task(_generate())
+    send_task = asyncio.create_task(_send())
+    try:
+        await asyncio.gather(recv_task, gen_task, send_task)
+    except Exception as e:
+        logger.warning(f"WS stream-input pipeline error: {e}")
+    finally:
+        for t in (recv_task, gen_task, send_task):
+            if not t.done():
+                t.cancel()
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @router.get("/models")
