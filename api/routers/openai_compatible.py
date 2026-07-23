@@ -855,10 +855,34 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = ""):
         For all other formats: send chunks as fast as they arrive — the client
         buffers (mobile AudioTrack, Web Audio API, etc.).
         """
+        # Wait for the config frame before reading response_format — otherwise
+        # _send races _receive and captures the default ("ulaw_8000"), applying
+        # the real-time ulaw pacer to every stream. For pcm_16000 that pacer
+        # sleeps 200ms per 1600 bytes (= only 50ms of 16 kHz audio), throttling
+        # output to exactly 0.25x real time. _generate already waits here.
+        await config_ready.wait()
         fmt = state["response_format"]
         pace = fmt == "ulaw_8000"
         buffer = bytearray()
         next_send = None
+
+        # Coalesce raw-PCM formats into ~COALESCE_MS-of-audio messages so a
+        # high-sample-rate format (pcm_16000, pcm) is not fragmented into ~4x as
+        # many WS frames as ulaw — each frame carries a fixed per-message cost
+        # (json + base64 + send/recv), so fragmentation, not generation, is what
+        # made pcm_16000 run at ~0.25x real time. These are delivered as fast as
+        # generated (NO real-time sleep): the phone client already paces to
+        # Telnyx (20ms framing + prebuffer), and a second real-time pacer here
+        # would fight it. ulaw keeps its own real-time pacer below. The first
+        # message is emitted the instant it is available so TTFB does not
+        # regress. A future config-frame `output_chunk_ms` could override
+        # COALESCE_MS for finer-grained transports (e.g. a browser leg).
+        COALESCE_MS = 200
+        _raw_bytes_per_sec = {"pcm_16000": 16000 * 2, "pcm": 24000 * 2}
+        coalesce = fmt in _raw_bytes_per_sec
+        target_bytes = int(_raw_bytes_per_sec.get(fmt, 0) * COALESCE_MS / 1000)
+        cbuf = bytearray()
+        first_sent = False
 
         async def _emit(data: bytes):
             await websocket.send_json({"audio": base64.b64encode(data).decode()})
@@ -870,8 +894,22 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = ""):
                     break
 
                 if not pace:
-                    # Non-ulaw: send immediately as chunks arrive
-                    await _emit(chunk)
+                    if not coalesce:
+                        # Container/compressed formats: send as chunks arrive.
+                        await _emit(chunk)
+                        continue
+                    # Raw-PCM: coalesce to ~COALESCE_MS per message, no sleep.
+                    cbuf.extend(chunk)
+                    if not first_sent:
+                        # Emit the first message immediately to preserve TTFB,
+                        # then batch the rest up to the duration target.
+                        await _emit(bytes(cbuf))
+                        cbuf.clear()
+                        first_sent = True
+                        continue
+                    while len(cbuf) >= target_bytes:
+                        await _emit(bytes(cbuf[:target_bytes]))
+                        del cbuf[:target_bytes]
                     continue
 
                 # ulaw_8000: pace at real-time
@@ -900,6 +938,10 @@ async def websocket_tts_stream(websocket: WebSocket, voice_id: str = ""):
                     next_send += ULAW_CHUNK_INTERVAL
                 if buffer:
                     await _emit(bytes(buffer))
+
+            # Flush coalesce remainder for raw-PCM formats.
+            elif coalesce and cbuf:
+                await _emit(bytes(cbuf))
 
             await websocket.send_json({"isFinal": True})
         except WebSocketDisconnect:
